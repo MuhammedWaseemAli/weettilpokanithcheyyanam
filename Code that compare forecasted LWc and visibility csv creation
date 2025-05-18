@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Monthly ERA-5 → **3-h-ahead fog forecast** → QCLOUD/LWC  vs  visibility (station-only)  
+Author : Waseem • 21-May-2025   (forecast edition)
+
+Differences from the “instantaneous” script
+────────────────────────────────────────────
+• Uses a model trained on predictors at *t* to forecast QCLOUD three hours later.  
+• Predictions are therefore timestamped **t + 3 h**.  
+• The final three timestamps of every month have no forecast (no predictors for t + 3 h).  
+• Everything else – CSV layout, visibility matching, output folders – is unchanged.
+"""
+
+# ───────────────────────── 0 · CONFIG ────────────────────────────────
+ROOT_DIR   = "/lfs/usrhome/facs/chandan15tb/waseem /ERAmonthwise"
+MODEL_PATH = "/lfs/usrhome/facs/chandan15tb/waseem /ERAmonthwise/rf_3var_model.joblib"  # ← NEW model
+VIS_CSV    = "/lfs/usrhome/facs/chandan15tb/waseem /ERAmonthwise/merged_insitu.csv"
+OUT_BASE   = "/lfs/usrhome/facs/chandan15tb/waseem /FOG_OUTPUTminimalfinalshortcutforecast"
+
+FORECAST_HR    = 3           # ← HOW FAR AHEAD WE FORECAST
+RADIUS_KM      = 25          # search radius around each station
+TOLERANCE_MIN  = 30          # max vis–pred time diff to merge (±30 min)
+
+# ───────────────────────── imports ───────────────────────────────────
+import os, re, warnings, joblib
+import numpy as np, pandas as pd, netCDF4 as nc
+from sklearn.impute import SimpleImputer
+from scipy.spatial import cKDTree
+warnings.filterwarnings("ignore")
+
+ρ_air = 1.125   # kg m⁻³   (QCLOUD → LWC)
+
+DEBUG = os.getenv("DEBUG", "0") == "1"
+def dbg(msg):  print(f"[DEBUG] {msg}", flush=True) if DEBUG else None
+def log(msg):  print(msg, flush=True)
+
+# ─────────────────── 1 · HELPERS — generic ───────────────────────────
+def rename_variables(nc_path, mapping):
+    """Rename variables inside a NetCDF file to match the joblib model."""
+    with nc.Dataset(nc_path, "r+") as ds:
+        for old, new in mapping.items():
+            if old in ds.variables and new not in ds.variables:
+                ds.renameVariable(old, new); dbg(f"renamed {old}→{new}")
+
+def decode_times(ds):
+    """Return a Pandas DatetimeIndex from Times/time/valid_time variable."""
+    for key in ("Times", "time", "valid_time"):
+        if key in ds.variables:
+            tvar = ds.variables[key]; break
+    else:
+        raise KeyError("No Times/time/valid_time variable found")
+
+    vals = tvar[:]
+    if tvar.dtype.kind in ("S", "U"):                     # char array
+        s = nc.chartostring(vals)
+        return pd.to_datetime(np.char.decode(s, "ascii"), errors="coerce")
+    if hasattr(tvar, "units"):                            # numeric
+        d = nc.num2date(vals, tvar.units,
+                        only_use_cftime_datetimes=False)
+        return pd.to_datetime([dt.isoformat() for dt in d], errors="coerce")
+    raise RuntimeError("Un-decodable time variable")
+
+# ───────────── 2 · visibility utilities ──────────────────────────────
+_vis_digits = re.compile(r"^\s*([\d/]{1,6})")
+def parse_visibility(raw):
+    """Convert VIS like '000400,1,N,1' → 400 m (NaN if /// or ≥99999)."""
+    if pd.isna(raw): return np.nan
+    token = _vis_digits.search(str(raw))
+    if not token:     return np.nan
+    num = token.group(1).replace("/", "")
+    if not num or int(num) >= 99999: return np.nan
+    return int(num)
+
+# ─────────── 3 · station ⇄ grid helpers ──────────────────────────────
+def build_station_map(ds, stations_df, radius_km):
+    """Return {station_name: [flat_grid_indices]} within radius."""
+    lat_raw, lon_raw = ds.variables["XLAT"][:], ds.variables["XLONG"][:]
+
+    # 1-D → make 2-D grids so everything downstream gets (n_lat, n_lon)
+    if lat_raw.ndim == 1 and lon_raw.ndim == 1:
+        lat2d, lon2d = np.meshgrid(lat_raw, lon_raw, indexing="ij")
+    else:
+        lat2d, lon2d = lat_raw, lon_raw
+
+    flat_coords = np.vstack([lat2d.ravel(), lon2d.ravel()]).T
+    tree        = cKDTree(np.radians(flat_coords))
+    rad         = radius_km / 6371.0                       # km → rad
+
+    mapping = {}
+    for _, row in stations_df.iterrows():
+        name, lat0, lon0 = row.NAME, float(row.LATITUDE), float(row.LONGITUDE)
+        idxs = tree.query_ball_point(np.radians([lat0, lon0]), r=rad)
+        if not idxs:                          # nothing in radius → nearest
+            _, idx_near = tree.query(np.radians([lat0, lon0]), k=1)
+            idxs = [int(idx_near)]
+        mapping[name] = idxs
+    dbg(f"station_map sizes: {[len(v) for v in mapping.values()]}")
+    return mapping, lat2d.shape               # (n_lat, n_lon)
+
+# ─────────── 4 · PREDICT (3-h-ahead) ─────────────────────────────────
+def predict_for_stations(ds, tidx, station_map, grid_shape, model, imputer):
+    """
+    Predict QCLOUD *FORECAST_HR hours ahead* for every station.
+
+    For each time step t (except last FORECAST_HR), we:
+      • build feature vector at t,
+      • feed to model → QCLOUD forecast for t+3 h,
+      • stamp the prediction with timestamp = tidx[t] + 3 h.
+    """
+    rh = ds.variables["RELHUM3D"][:,0] / 100.0
+    sh = ds.variables["QVAPOR"][:,0]
+    u  = ds.variables["U"][:,0]
+    v  = ds.variables["V"][:,0]
+    w  = ds.variables["w"][:,0]
+
+    rows = []
+    n_lat, n_lon = grid_shape
+    last_valid_t = len(tidx) - FORECAST_HR      # exclusive
+
+    for t in range(last_valid_t):
+        ts_pred = tidx[t] + pd.Timedelta(hours=FORECAST_HR)
+
+        # cache wind-speed slice at t
+        ws_slice = np.sqrt(u[t]**2 + v[t]**2 + w[t]**2)
+
+        for stn, flat_idxs in station_map.items():
+            feats = []
+            for idx in flat_idxs:               # unravel flat → (j,i)
+                j, i = divmod(idx, n_lon)
+                feats.append([rh[t,j,i], sh[t,j,i], ws_slice[j,i]])
+            X = imputer.fit_transform(feats)
+            qc_pred = model.predict(X).mean()   # mean over grid pts
+            rows.append(dict(
+                station            = stn,
+                time_stamp         = ts_pred,
+                predicted_qcloud   = float(qc_pred)
+            ))
+
+    df = pd.DataFrame(rows)
+    df["predicted_LWC_gm3"] = df.predicted_qcloud * ρ_air * 1000.0
+    return df
+
+# ─────────── 5 · compare with visibility ────────────────────────────
+def compare_with_visibility(pred_df, vis_df, out_dir):
+    if pred_df.empty: return
+    os.makedirs(out_dir, exist_ok=True)
+
+    full_hours = pd.date_range(pred_df.time_stamp.min(),
+                               pred_df.time_stamp.max(), freq="1H")
+
+    all_combined = []
+    for name, grp in vis_df.groupby("NAME"):
+        vis_clean = grp.copy()
+        vis_clean["Visibility"] = grp["VIS"].apply(parse_visibility)
+        vis_clean = vis_clean.sort_values("DATE")
+
+        pred_sub = (pred_df[pred_df.station==name]
+                    .set_index("time_stamp")
+                    .reindex(full_hours)
+                    .rename_axis("datetime")
+                    .reset_index())
+
+        merged = pd.merge_asof(pred_sub.sort_values("datetime"),
+                               vis_clean[["DATE","Visibility"]]
+                                        .rename(columns={"DATE":"vis_time"}),
+                               left_on="datetime", right_on="vis_time",
+                               direction="nearest",
+                               tolerance=pd.Timedelta(minutes=TOLERANCE_MIN))
+        merged["station"] = name
+        merged.to_csv(os.path.join(out_dir, f"{name.replace(' ','_')}.csv"),
+                      index=False)
+        all_combined.append(merged)
+
+    if all_combined:
+        pd.concat(all_combined).to_csv(os.path.join(out_dir,"ALL_Stations.csv"),
+                                       index=False)
+    log("  · station CSVs written")
+
+# ───────────────────── 6 · MAIN LOOP ────────────────────────────────
+def main():
+    rename_map = dict(latitude="XLAT", longitude="XLONG",
+                      u="U", v="V", q="QVAPOR", r="RELHUM3D",
+                      ssrd="SWDNB", valid_time="Times", time="Times")
+
+    model   = joblib.load(MODEL_PATH)
+    vis_raw = pd.read_csv(VIS_CSV, parse_dates=["DATE"], low_memory=False)
+
+    stations = vis_raw[["NAME","LATITUDE","LONGITUDE"]].drop_duplicates()
+
+    pat = re.compile(r"(january|february|december)-(\d{4})\.nc$", re.I)
+
+    for root, _, files in os.walk(ROOT_DIR):
+        for f in sorted(files):
+            m = pat.match(f.lower())
+            if not m: continue
+            month, year = m.groups()
+            nc_path = os.path.join(root, f)
+            out_dir = os.path.join(OUT_BASE, month, year)
+            os.makedirs(out_dir, exist_ok=True)
+
+            log(f"\n========== {month.title()} {year} — 3 h Forecast ==========")
+            rename_variables(nc_path, rename_map)
+
+            with nc.Dataset(nc_path) as ds:
+                tidx = decode_times(ds)
+                station_map, grid_shape = build_station_map(ds, stations, RADIUS_KM)
+                imputer = SimpleImputer(strategy="mean")
+                preds   = predict_for_stations(ds, tidx, station_map,
+                                               grid_shape, model, imputer)
+
+            preds.to_csv(os.path.join(out_dir, "predictions_by_station_3h.csv"),
+                         index=False)
+
+            vis_sub = vis_raw[(vis_raw.DATE.dt.year == int(year)) &
+                              (vis_raw.DATE.dt.month ==
+                               ["january","february","december"]
+                               .index(month) + 1)]
+            compare_with_visibility(preds, vis_sub,
+                                    os.path.join(out_dir, "stations"))
+
+    log("\n✔ ALL DONE (3-h forecasts)")
+
+if __name__ == "__main__":
+    main()
