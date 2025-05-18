@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+ERA-5 fog post-processing  – final fix
+──────────────────────────────────────────────────────────────────────
+ • Keeps the exact input hierarchy  <month>/<year>/stations/*.csv
+   and writes results to
+   /plots for going back home/<month>/<year>/plots/…
+ • No cap on predicted LWC (visibility still capped at 3000 m)
+ • Inverted visibility axis
+ • 6-hour skill scores for each month-year and a grand-total CSV
+Author : Waseem · 20-May-2025
+"""
+
+# ───────── USER CONFIG ─────────────────────────────────────────────
+ROOT_RESULTS = "/lfs/usrhome/facs/chandan15tb/waseem /FOG_OUTPUTminimalfinalshortcut/dec/"
+PLOTS_ROOT   = "/lfs/usrhome/facs/chandan15tb/waseem/sss"
+
+VIS_CAP        = 3000
+FOG_VIS_THRESH = 1000
+FOG_QCLOUD_TH  = 0.01
+
+BIN = "6H"          # resample window
+TOL = "1H"          # merge tolerance
+
+FONT_PATH = "/usr/share/fonts/truetype/msttcorefonts/tahoma.ttf"
+# ────────────────────────────────────────────────────────────────────
+
+import os, glob, warnings, collections
+from pathlib import Path
+import numpy as np, pandas as pd, seaborn as sns, matplotlib.pyplot as plt
+from matplotlib import font_manager
+from sklearn.metrics import confusion_matrix
+
+# ─── style ──────────────────────────────────────────────────────────
+try: font_manager.fontManager.addfont(FONT_PATH)
+except FileNotFoundError:
+    warnings.warn("Tahoma font not found – default font used.")
+plt.rcParams["font.family"] = "Tahoma"
+sns.set_style("whitegrid")
+sns.set_context("poster", font_scale=1.2)
+
+# ─── utilities ─────────────────────────────────────────────────────
+def calc_skill(cm):
+    tn, fp, fn, tp = cm.ravel()
+    acc  = (tp+tn)/(tp+tn+fp+fn) if (tp+tn+fp+fn) else 0
+    pod  = tp/(tp+fn) if (tp+fn) else 0
+    far  = fp/(tp+fp) if (tp+fp) else 0
+    f1   = (2*tp)/(2*tp+fp+fn) if (2*tp+fp+fn) else 0
+    csi  = tp/(tp+fp+fn) if (tp+fp+fn) else 0
+    pofd = fp/(fp+tn) if (fp+tn) else 0
+    return {k: v*100 for k, v in
+            dict(Accuracy=acc,POD=pod,Recall=pod,FAR=far,F1=f1,
+                 CSI=csi,POFD=pofd).items()}
+
+def plot_confmat(cm_pct, title, out_png):
+    plt.figure(figsize=(6,5))
+    sns.heatmap(cm_pct, annot=True, cmap="Blues", fmt=".1f",
+                xticklabels=["No Fog","Fog"],
+                yticklabels=["No Fog","Fog"])
+    plt.xlabel("Predicted"); plt.ylabel("Observed"); plt.title(title)
+    plt.tight_layout(); plt.savefig(out_png, dpi=300); plt.close()
+
+def plot_timeseries(df, city, out_png):
+    trans = df.loc[(df.pred_gm3.shift(1, fill_value=0).abs()<1e-3) &
+                   (df.pred_gm3.abs()>1e-3), "datetime"]
+
+    fig, ax1 = plt.subplots(figsize=(14,8)); ax1.grid(False)
+
+    # visibility
+    ax1.set_xlabel("Time", labelpad=15, fontsize=18)
+    ax1.set_ylabel("Visibility (m)", color="crimson",
+                   fontsize=30, labelpad=15)
+    ax1.plot(df.datetime, df.visibility, "o-", c="crimson",
+             ms=6, lw=2.5, label="Visibility")
+    ax1.set_ylim(-100, VIS_CAP+100); ax1.invert_yaxis()
+    ax1.set_yticks(np.arange(0, VIS_CAP+1, 1000))
+    ax1.tick_params(axis="y", labelcolor="crimson")
+
+    # LWC
+    ax2 = ax1.twinx(); ax2.grid(False)
+    ax2.set_ylabel("Predicted LWC (g m⁻³)", color="blue",
+                   fontsize=30, labelpad=15)
+    ax2.plot(df.datetime, df.pred_gm3, "o-", c="blue",
+             ms=6, lw=2.5, label="Predicted LWC")
+    ymax = df.pred_gm3.max()*1.05 if df.pred_gm3.max()>0 else 0.02
+    ax2.set_ylim(-0.02, ymax)
+    ax2.tick_params(axis="y", labelcolor="blue")
+
+    # horizontal grid lines
+    for y in range(0, VIS_CAP+1, 1000):
+        ax1.axhline(y, color="gray", ls="-", alpha=.2, zorder=0)
+
+    # genesis lines
+    for i, t in enumerate(trans):
+        ax2.axvline(t, color="green", ls="--", alpha=.7,
+                    label="Genesis Predicted" if i==0 else None)
+
+    # legend
+    h1, l1 = ax1.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    leg = ax1.legend(h1+h2, l1+l2, loc="upper left", fontsize=16,
+                     prop={"size":12}, bbox_to_anchor=(0.01,0.99),
+                     handlelength=1, handletextpad=.5, markerscale=1)
+    leg.get_frame().set_linewidth(.5)
+
+    plt.setp(ax1.get_xticklabels(), rotation=30, ha="right")
+    fig.suptitle(f"\n{city}", fontsize=25, fontweight="bold")
+    sns.despine(ax=ax1, right=False, left=False)
+    sns.despine(ax=ax2, right=False, left=False)
+    fig.tight_layout(); fig.savefig(out_png, dpi=300); plt.close()
+
+def process_station_csv(csv_path: Path, out_dir: Path):
+    """Read one per-station CSV, compute 6-hour skill, save plots.
+       Returns (g, sc, cm) or (None, None, None) if skipped."""
+
+    # ── 1 · Load & normalise headers ───────────────────────────────
+    df = pd.read_csv(csv_path, low_memory=False)
+    df.columns = df.columns.str.strip()                # trim ‘ Visibility ’ → ‘Visibility’
+    # case-insensitive map → lower-case → canonical name
+    df = df.rename(columns={c.lower(): c for c in df.columns})
+    df = df.rename(columns={
+        "datetime":           "pred_time",
+        "predicted_lwc_gm3":  "pred_gm3",
+        "predicted_lwc_g/m3": "pred_gm3",      # <- in case someone used this
+        "vis_time":           "obs_time",
+        "visibility":         "visibility"
+    })
+
+    # ── 2 · Basic cleaning ─────────────────────────────────────────
+    for col in ("pred_time", "obs_time"):
+        if col in df:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    df = df.dropna(subset=["pred_time", "pred_gm3"])
+    df["pred_gm3"]   = pd.to_numeric(df["pred_gm3"],   errors="coerce")
+    df["visibility"] = pd.to_numeric(df["visibility"], errors="coerce")\
+                           .clip(upper=VIS_CAP)
+
+    # ── 3 · Merge nearest obs (±TOL) ───────────────────────────────
+    obs  = (df.dropna(subset=["obs_time", "visibility"])
+              [["obs_time", "visibility"]]
+              .rename(columns={"obs_time": "time"})
+              .sort_values("time"))
+    pred = (df[["pred_time", "pred_gm3"]]
+              .rename(columns={"pred_time": "time"})
+              .sort_values("time"))
+
+    merged = pd.merge_asof(pred, obs, on="time", direction="nearest",
+                           tolerance=pd.Timedelta(TOL))
+
+    if merged["visibility"].isna().all():
+        print(f"   ⚠ {csv_path.name:20s}  skipped → no obs within ±{TOL}")
+        return None, None, None
+
+    merged = merged.dropna(subset=["visibility"])
+
+    # ── 4 · 6-hour bin & skill ─────────────────────────────────────
+    g = (merged.set_index("time")
+                 .resample(BIN, origin="start", label="left", closed="left")
+                 .mean().dropna().reset_index())
+    if g.empty:
+        print(f"   ⚠ {csv_path.name:20s}  skipped → resample produced 0 rows")
+        return None, None, None
+
+    g["time_mid"] = g["time"] + pd.Timedelta(BIN) / 2
+    g["obs_fog"]  = (g["visibility"] < FOG_VIS_THRESH).astype(int)
+    g["pred_fog"] = (g["pred_gm3"]  > FOG_QCLOUD_TH ).astype(int)
+
+    cm = confusion_matrix(g["obs_fog"], g["pred_fog"], labels=[0, 1])
+    sc = calc_skill(cm)
+
+    # ── 5 · Plots ──────────────────────────────────────────────────
+    out_dir.mkdir(parents=True, exist_ok=True)
+    base = csv_path.stem
+    plot_confmat(cm / cm.sum() * 100,
+                 f"Confusion Matrix — {base} ({BIN})",
+                 out_dir / f"{base}_confmat_{BIN}.png")
+    plot_timeseries(g.rename(columns={"time_mid": "datetime"}), base,
+                    out_dir / f"{base}_timeseries_{BIN}.png")
+
+    # (optional) save merged file for quick inspection
+    # merged.to_csv(out_dir / f"{base}_merged_debug.csv", index=False)
+
+    return g, sc, cm
+
+
+# ─── gather all CSVs and group by <month>/<year> ────────────────────
+print(f"Scanning {ROOT_RESULTS} …")
+station_csvs = glob.glob(os.path.join(ROOT_RESULTS, "**", "stations", "*.csv"),
+                         recursive=True)
+if not station_csvs:
+    raise SystemExit("❌  No per-station CSVs found; run the main pipeline first.")
+
+# groups:  { Path('february/2003'): [csv1, csv2, …], … }
+import collections, itertools
+groups = collections.defaultdict(list)
+for path in station_csvs:
+    rel_parts = Path(path).relative_to(ROOT_RESULTS).parts  # ('february','2003','stations',file)
+    month_year = Path(rel_parts[0]) / rel_parts[1]
+    groups[month_year].append(Path(path))
+
+# will collect every month-year line ↓
+master_rows = []
+# to build overall confusion matrices per station ↓
+station_obs  = collections.defaultdict(list)
+station_pred = collections.defaultdict(list)
+
+grand_obs, grand_pred = [], []
+
+for month_year, files in sorted(groups.items()):
+    plots_dir  = Path(PLOTS_ROOT) / month_year / "plots"
+    skills_csv = Path(PLOTS_ROOT) / month_year / "station_skill_scores_6h.csv"
+
+    print(f"\n── {month_year}  ({len(files)} stations) ──")
+    skill_rows, month_pairs = [], []
+
+    for f in files:
+        g, sc, _ = process_station_csv(f, plots_dir)
+        if g is None:
+            continue
+        stn = f.stem
+        # -------- store monthly line ----------
+        master_rows.append(dict(month=str(month_year.parts[0]),
+                                year =str(month_year.parts[1]),
+                                station=stn, **sc))
+        skill_rows.append(dict(station=stn, **sc))
+        # -------- accumulate obs/pred ----------
+        station_obs [stn].append(g.obs_fog)
+        station_pred[stn].append(g.pred_fog)
+        month_pairs.append(g[["obs_fog","pred_fog"]])
+        grand_obs.append(g.obs_fog)
+        grand_pred.append(g.pred_fog)
+
+    # overall month-year skill
+    if month_pairs:
+        all_df = pd.concat(month_pairs)
+        cm     = confusion_matrix(all_df.obs_fog, all_df.pred_fog, labels=[0,1])
+        sc_all = calc_skill(cm)
+        plot_confmat(cm/cm.sum()*100,
+                     f"Overall Confusion Matrix ({month_year})",
+                     plots_dir/"overall_confmat_6h.png")
+        skill_rows.append(dict(station="ALL COMBINED", **sc_all))
+
+    if skill_rows:
+        pd.DataFrame(skill_rows).to_csv(skills_csv, index=False)
+        print(f"   ↳ skill CSV → {skills_csv.relative_to(PLOTS_ROOT)}")
+
+# ─── create per-station OVERALL lines ───────────────────────────────
+for stn in station_obs:
+    obs_concat  = pd.concat(station_obs [stn])
+    pred_concat = pd.concat(station_pred[stn])
+    cm_over     = confusion_matrix(obs_concat, pred_concat, labels=[0,1])
+    sc_over     = calc_skill(cm_over)
+    master_rows.append(dict(month="ALL", year="ALL", station=stn, **sc_over))
+
+# ─── grand total (all stations, all months) ─────────────────────────
+if grand_obs:
+    big_cm = confusion_matrix(pd.concat(grand_obs),
+                              pd.concat(grand_pred),
+                              labels=[0,1])
+    big_sc = calc_skill(big_cm)
+    pd.DataFrame(big_sc, index=["ALL_DATA"]).T.to_csv(
+        Path(PLOTS_ROOT)/"ALL_MONTHS_combined_skill_6h.csv")
+    print("\nGrand-total skill CSV → ALL_MONTHS_combined_skill_6h.csv")
+
+# ─── dump master CSV ────────────────────────────────────────────────
+master_df = pd.DataFrame(master_rows)
+master_df.to_csv(Path(PLOTS_ROOT)/"MASTER_station_skill_scores.csv", index=False)
+print("Master station-by-station skill CSV → MASTER_station_skill_scores.csv")
+
+print("\n✔  All plots & skill scores saved under")
+print(f"   {PLOTS_ROOT}")
